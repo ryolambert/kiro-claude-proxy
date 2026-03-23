@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	jsonStr "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -289,8 +291,15 @@ const (
 	profileArnIAM = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
 
 	// Payload safety limits for CodeWhisperer
-	maxToolDescLen  = 200    // max characters per tool description
-	maxPayloadBytes = 250000 // ~250KB soft limit for total request JSON
+	maxToolDescLen       = 200     // max characters per tool description
+	maxPayloadBytes      = 250000  // ~250KB soft limit for total request JSON
+	maxRequestBodyBytes  = 1 << 20 // 1 MiB max inbound request body
+	serverReadTimeout    = 30 * time.Second
+	serverWriteTimeout   = 60 * time.Second
+	serverIdleTimeout    = 120 * time.Second
+	serverHeaderTimeout  = 10 * time.Second
+	upstreamHTTPTimeout  = 60 * time.Second
+	defaultListenAddress = "127.0.0.1"
 )
 
 var ModelMap = map[string]string{
@@ -1047,33 +1056,71 @@ func getToken() (TokenData, error) {
 	return token, nil
 }
 
+func debugLoggingEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("KIROLINK_DEBUG"))) {
+	case "1", "true", "yes", "on", "debug":
+		return true
+	default:
+		return false
+	}
+}
+
+func debugLogf(format string, args ...any) {
+	if debugLoggingEnabled() {
+		log.Printf(format, args...)
+	}
+}
+
+func debugLogBodySummary(label string, body []byte) {
+	if !debugLoggingEnabled() {
+		return
+	}
+	sum := sha256.Sum256(body)
+	debugLogf("%s size=%d sha256=%x", label, len(body), sum[:8])
+}
+
+func upstreamHTTPClient() *http.Client {
+	return &http.Client{Timeout: upstreamHTTPTimeout}
+}
+
+func serverAddress(port string) string {
+	return net.JoinHostPort(defaultListenAddress, port)
+}
+
+func newHTTPServer(port string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              serverAddress(port),
+		Handler:           handler,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+		ReadHeaderTimeout: serverHeaderTimeout,
+	}
+}
+
+func handlePanic(w http.ResponseWriter, recovered any) {
+	if recovered == nil {
+		return
+	}
+	log.Printf("panic in request handler: %v", recovered)
+	http.Error(w, `{"error":{"type":"server_error","message":"Internal server error"}}`, http.StatusInternalServerError)
+}
+
 // logMiddleware logs all HTTP requests
 func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
-
-		// fmt.Printf("\n=== Request Received ===\n")
-		// fmt.Printf("Time: %s\n", startTime.Format("2006-01-02 15:04:05"))
-		// fmt.Printf("Request Method: %s\n", r.Method)
-		// fmt.Printf("Request Path: %s\n", r.URL.Path)
-		// fmt.Printf("Client IP: %s\n", r.RemoteAddr)
-		// fmt.Printf("Headers:\n")
-		// for name, values := range r.Header {
-		// 	fmt.Printf("  %s: %s\n", name, strings.Join(values, ", "))
-		// }
 
 		// Call next handler
 		next(w, r)
 
 		// Measure processing duration
 		duration := time.Since(startTime)
-		fmt.Printf("Processing time: %v\n", duration)
-		fmt.Printf("=== Request ended ===\n\n")
+		log.Printf("%s %s completed in %v", r.Method, r.URL.Path, duration)
 	}
 }
 
-// startServer starts the HTTP proxy server
-func startServer(port string) {
+func newProxyHandler() http.Handler {
 	// Create router
 	mux := http.NewServeMux()
 
@@ -1081,7 +1128,6 @@ func startServer(port string) {
 	mux.HandleFunc("/v1/messages", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only handle POST requests
 		if r.Method != http.MethodPost {
-			fmt.Printf("Error: Unsupported request method\n")
 			http.Error(w, "Only POST requests are supported", http.StatusMethodNotAllowed)
 			return
 		}
@@ -1089,26 +1135,31 @@ func startServer(port string) {
 		// Get current token
 		token, err := getToken()
 		if err != nil {
-			fmt.Printf("Error: Failed to get token: %v\n", err)
+			log.Printf("failed to get token: %v", err)
 			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
 			return
 		}
 
 		// Read request body
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		defer r.Body.Close()
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			fmt.Printf("Error: Failed to read request body: %v\n", err)
-			http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusInternalServerError)
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, fmt.Sprintf("Request body exceeds %d bytes", maxRequestBodyBytes), http.StatusRequestEntityTooLarge)
+				return
+			}
+			log.Printf("failed to read request body: %v", err)
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 			return
 		}
-		defer r.Body.Close()
-
-		fmt.Printf("\n=========================Anthropic Request Body:\n%s\n=======================================\n", string(body))
+		debugLogBodySummary("anthropic request", body)
 
 		// Parse Anthropic request
 		var anthropicReq AnthropicRequest
 		if err := jsonStr.Unmarshal(body, &anthropicReq); err != nil {
-			fmt.Printf("Error: Failed to parse request body: %v\n", err)
+			log.Printf("failed to parse request body: %v", err)
 			http.Error(w, fmt.Sprintf("Failed to parse request body: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -1127,15 +1178,15 @@ func startServer(port string) {
 			anthropicReq.Model = "default"
 		}
 		if _, ok := ModelMap[strings.ToLower(strings.TrimSpace(anthropicReq.Model))]; !ok {
-			fmt.Printf("Warning: Unknown model alias %q, using fallback %q\n", anthropicReq.Model, resolvedModel)
+			log.Printf("unknown model alias %q, using fallback %q", anthropicReq.Model, resolvedModel)
 		}
 
 		// Handle streaming request
 		if anthropicReq.Stream {
 			func() {
 				defer func() {
-					if r := recover(); r != nil {
-						fmt.Printf("PANIC in streaming handler: %v\n", r)
+					if recovered := recover(); recovered != nil {
+						log.Printf("panic in streaming handler: %v", recovered)
 					}
 				}()
 				handleStreamRequest(w, anthropicReq, token.AccessToken)
@@ -1146,10 +1197,7 @@ func startServer(port string) {
 		// Handle non-streaming request
 		func() {
 			defer func() {
-				if r := recover(); r != nil {
-					fmt.Printf("PANIC in non-streaming handler: %v\n", r)
-					http.Error(w, fmt.Sprintf(`{"error":{"type":"server_error","message":"Internal panic: %v"}}`, r), http.StatusInternalServerError)
-				}
+				handlePanic(w, recover())
 			}()
 			handleNonStreamRequest(w, anthropicReq, token.AccessToken)
 		}()
@@ -1193,20 +1241,27 @@ func startServer(port string) {
 
 	// Add 404 handler
 	mux.HandleFunc("/", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("Warning: unknown endpoint accessed\n")
+		log.Printf("unknown endpoint accessed: %s", r.URL.Path)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 	}))
 
-	// Start server
-	fmt.Printf("Starting Anthropic API proxy server on port: %s\n", port)
-	fmt.Printf("Available endpoints:\n")
-	fmt.Printf("  POST /v1/messages - Anthropic API proxy\n")
-	fmt.Printf("  GET  /v1/models   - List available models\n")
-	fmt.Printf("  GET  /health      - Health check\n")
-	fmt.Printf("Press Ctrl+C to stop the server\n")
+	return mux
+}
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		fmt.Printf("Failed to start server: %v\n", err)
+// Start server
+// startServer starts the HTTP proxy server
+func startServer(port string) {
+	server := newHTTPServer(port, newProxyHandler())
+
+	log.Printf("Starting Anthropic API proxy server on %s", server.Addr)
+	log.Printf("Available endpoints:")
+	log.Printf("  POST /v1/messages - Anthropic API proxy")
+	log.Printf("  GET  /v1/models   - List available models")
+	log.Printf("  GET  /health      - Health check")
+	log.Printf("Press Ctrl+C to stop the server")
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Printf("Failed to start server: %v", err)
 		os.Exit(1)
 	}
 }
@@ -1539,6 +1594,12 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("panic in streaming handler: %v", recovered)
+			sendErrorEvent(w, flusher, "Internal server error", nil)
+		}
+	}()
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
@@ -1552,7 +1613,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		return
 	}
 
-	fmt.Printf("CodeWhisperer streaming request body:\n%s\n", string(cwReqBody))
+	debugLogBodySummary("codewhisperer streaming request", cwReqBody)
 
 	// Create streaming proxy request
 	proxyReq, err := http.NewRequest(
@@ -1571,7 +1632,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	proxyReq.Header.Set("Accept", "text/event-stream")
 
 	// Send request with retry on "Improperly formed request"
-	client := &http.Client{}
+	client := upstreamHTTPClient()
 
 	var resp *http.Response
 	const maxRetries = 3
@@ -1605,10 +1666,11 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		respBodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		respStr := string(respBodyBytes)
-		fmt.Printf("CodeWhisperer STREAM response error, status code: %d, response: %s\n", resp.StatusCode, respStr)
+		debugLogBodySummary("codewhisperer streaming error response", respBodyBytes)
+		log.Printf("CodeWhisperer streaming request failed with status %d", resp.StatusCode)
 
 		if resp.StatusCode == 400 && strings.Contains(respStr, "Improperly formed request") && attempt < maxRetries-1 {
-			fmt.Printf("CodeWhisperer STREAM improperly formed request; retrying with trimmed payload (attempt %d)\n", attempt+1)
+			log.Printf("CodeWhisperer streaming request improperly formed; retrying with trimmed payload (attempt %d)", attempt+1)
 			// Aggressively trim retry payload while keeping the most recent caller history.
 			cwReq.ConversationState.History = keepMostRecentHistory(cwReq.ConversationState.History, 2)
 			// Strip tools to just name + minimal schema
@@ -1622,13 +1684,13 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 				sendErrorEvent(w, flusher, "Failed to serialize retry request", err)
 				return
 			}
-			fmt.Printf("[retry] trimmed payload size: %d bytes\n", len(cwReqBody))
+			debugLogf("[retry] trimmed payload size: %d bytes", len(cwReqBody))
 			continue
 		}
 
 		// 403 = token expired — sync from Kiro CLI sqlite and retry once
 		if resp.StatusCode == 403 && attempt < maxRetries-1 {
-			fmt.Println("Token expired (403), syncing from Kiro CLI database...")
+			log.Printf("Token expired (403), syncing from Kiro CLI database...")
 			refreshToken()
 			newToken, tokenErr := getToken()
 			if tokenErr != nil {
@@ -1636,7 +1698,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 				return
 			}
 			accessToken = newToken.AccessToken
-			fmt.Println("Token synced, retrying request...")
+			log.Printf("Token synced, retrying request...")
 			continue
 		}
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", respStr))
@@ -1650,6 +1712,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: Failed to read response"))
 		return
 	}
+	debugLogBodySummary("codewhisperer streaming response", respBody)
 
 	// os.WriteFile(messageId+"response.raw", respBody, 0644)
 
@@ -1679,12 +1742,12 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Serialize with payload-size enforcement
 	cwReqBody, err := ensurePayloadFits(&cwReq)
 	if err != nil {
-		fmt.Printf("Error: Failed to serialize request: %v\n", err)
+		log.Printf("Failed to serialize request: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Printf("CodeWhisperer request body:\n%s\n", string(cwReqBody))
+	debugLogBodySummary("codewhisperer request", cwReqBody)
 
 	// Create proxy request
 	proxyReq, err := http.NewRequest(
@@ -1693,7 +1756,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
-		fmt.Printf("Error: Failed to create proxy request: %v\n", err)
+		log.Printf("Failed to create proxy request: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to create proxy request: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -1703,11 +1766,11 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	proxyReq.Header.Set("Content-Type", "application/json")
 
 	// Send request
-	client := &http.Client{}
+	client := upstreamHTTPClient()
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		fmt.Printf("Error: Failed to send request: %v\n", err)
+		log.Printf("Failed to send request: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -1716,12 +1779,12 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Read response
 	cwRespBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("Error: Failed to read response: %v\n", err)
+		log.Printf("Failed to read response: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Printf("CodeWhisperer response body:\n%s\n", string(cwRespBody))
+	debugLogBodySummary("codewhisperer response", cwRespBody)
 
 	respBodyStr := string(cwRespBody)
 
@@ -1729,7 +1792,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 
 	// Check if response is an error
 	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
-		fmt.Printf("Error: CodeWhisperer returned incorrect format: %s\n", respBodyStr)
+		log.Printf("CodeWhisperer returned incorrect format")
 		http.Error(w, fmt.Sprintf("Request format error: %s", respBodyStr), http.StatusBadRequest)
 		return
 	}
@@ -1755,8 +1818,7 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 		return
 	}
 
-	fmt.Printf("event: %s\n", eventType)
-	fmt.Printf("data: %v\n\n", string(json))
+	debugLogf("sse event=%s payload_size=%d", eventType, len(json))
 
 	fmt.Fprintf(w, "event: %s\n", eventType)
 	fmt.Fprintf(w, "data: %s\n\n", string(json))
