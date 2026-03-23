@@ -203,6 +203,10 @@ Run protocol tests only:
 go test ./protocol -v
 ```
 
+## Audit and packaging plan
+
+For a concise security/performance audit, Windows compatibility answer, `kiro2cc` lineage analysis, and a cross-platform packaging plan, see [`docs/security-performance-audit.md`](docs/security-performance-audit.md).
+
 ## Rough edges you should know about
 
 - This tool depends on a local Kiro token file already existing.
@@ -210,6 +214,7 @@ go test ./protocol -v
 - `claude` modifies `~/.claude.json`; that's convenient, but it's still changing your config, so don't run it blindly.
 - The documented export path is hardcoded to `http://localhost:8080`.
 - The upstream CodeWhisperer endpoint is hardcoded to `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`.
+- Windows users should note that `refresh` currently depends on `kiro-cli`'s SQLite database plus an external `sqlite3` executable.
 
 | Feature            | Supported natively | Handled by `kirolink` | Notes                    |
 | :----------------- | :----------------: | :-------------------: | :----------------------- |
