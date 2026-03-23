@@ -1248,7 +1248,6 @@ func newProxyHandler() http.Handler {
 	return mux
 }
 
-// Start server
 // startServer starts the HTTP proxy server
 func startServer(port string) {
 	server := newHTTPServer(port, newProxyHandler())
